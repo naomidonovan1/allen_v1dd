@@ -5,6 +5,10 @@ import pandas as pd
 import scipy.stats as st
 import matplotlib.pyplot as plt
 
+from sklearn.linear_model import Ridge
+from sklearn.model_selection import KFold
+import numpy as np
+
 # from statsmodels.sandbox.stats.multicomp import multipletests
 
 from .stimulus_analysis import StimulusAnalysis
@@ -59,6 +63,7 @@ class LocallySparseNoise(StimulusAnalysis):
         self._design_matrix = None
         self._trial_template = None
         self._receptive_fields = None
+        self._receptive_fields_sta = None
         self._rf_centers = None
         self._imshow_extent = None
         self._pvals = None
@@ -381,6 +386,56 @@ class LocallySparseNoise(StimulusAnalysis):
 
         return self._receptive_fields
 
+    @property
+    def receptive_fields_sta(self):
+        if self._receptive_fields_sta is None:
+            design_matrix_int = self.design_matrix.astype(
+                int
+            )  # shape (2*n_pixels, n_sweeps)
+
+            self._receptive_fields_sta = np.zeros(
+                (self.n_rois, 2, *self.image_shape), dtype=float
+            )
+
+            for roi in range(self.n_rois):
+                model, best_a, best_score = self.ridge_cv(
+                    design_matrix_int.T, self.sweep_responses[:, roi]
+                )
+                w = model.coef_  # shape (2*n_pixels,)
+                b = model.intercept_  # scalar
+
+                w_on = w[:112].reshape(*self.image_shape)
+                w_off = w[112:].reshape(*self.image_shape)
+
+                subfield_on = (w_on - w_on.mean()) / w_on.std()
+                subfield_on = subfield_on > 3
+
+                subfield_off = (w_off - w_off.mean()) / w_off.std()
+                subfield_off = subfield_off > 3
+
+                self._receptive_fields_sta[roi, 0, :, :] = subfield_on
+                self._receptive_fields_sta[roi, 1, :, :] = subfield_off
+
+        return self._receptive_fields_sta
+
+    def ridge_cv(self, X, y, alphas=np.logspace(-2, 4, 20), n_splits=4):
+        kf = KFold(n_splits=n_splits, shuffle=True, random_state=0)
+        best_a, best_score = None, -np.inf
+
+        for a in alphas:
+            scores = []
+            for tr, te in kf.split(X):
+                model = Ridge(alpha=a, fit_intercept=True)
+                model.fit(X[tr], y[tr])
+                # R^2 on heldout (or correlation)
+                scores.append(model.score(X[te], y[te]))
+            m = np.mean(scores)
+            if m > best_score:
+                best_score, best_a = m, a
+
+        model = Ridge(alpha=best_a, fit_intercept=True).fit(X, y)
+        return model, best_a, best_score
+
     def visualize_receptive_fields(self, roi):
 
         design_matrix_int = self.design_matrix.astype(
@@ -431,12 +486,20 @@ class LocallySparseNoise(StimulusAnalysis):
         if not self.is_roi_valid[roi]:
             print(f"ROI {roi} is not valid.")
 
-        fig, axs = plt.subplots(2, 4, figsize=(15, 5))
+        fig, axs = plt.subplots(2, 5, figsize=(15, 5))
 
         sub1 = axs[0, 0].imshow(num_resp_trials_on, cmap="coolwarm")
         fig.colorbar(sub1, ax=axs[0, 0], fraction=0.03)
         axs[0, 0].set_title("Number of Responsive Trials")
         axs[0, 0].axis("off")
+
+        z_scored_num_resp_trials_on = (
+            num_resp_trials_on - np.mean(num_resp_trials_on)
+        ) / np.std(num_resp_trials_on)
+        sub2 = axs[0, 1].imshow(z_scored_num_resp_trials_on, cmap="coolwarm")
+        fig.colorbar(sub2, ax=axs[0, 1], fraction=0.03)
+        axs[0, 1].set_title("Z-scored Num Responsive Trials")
+        axs[0, 1].axis("off")
 
         norm_mean_stim_for_resp_trials_on_weighted = (
             mean_stim_for_resp_trials_on_weighted
@@ -445,30 +508,38 @@ class LocallySparseNoise(StimulusAnalysis):
             np.max(mean_stim_for_resp_trials_on_weighted)
             - np.min(mean_stim_for_resp_trials_on_weighted)
         )
-        sub2 = axs[0, 1].imshow(norm_mean_stim_for_resp_trials_on_weighted, cmap="gray")
-        fig.colorbar(sub2, ax=axs[0, 1], fraction=0.03)
-        axs[0, 1].set_title("Weighted Mean Stimulus")
-        axs[0, 1].axis("off")
+        sub3 = axs[0, 2].imshow(norm_mean_stim_for_resp_trials_on_weighted, cmap="gray")
+        fig.colorbar(sub3, ax=axs[0, 2], fraction=0.03)
+        axs[0, 2].set_title("Weighted Mean Stimulus")
+        axs[0, 2].axis("off")
 
-        sub3 = axs[0, 2].imshow(
+        sub4 = axs[0, 3].imshow(
             z_value_results_on,
             cmap="coolwarm",
             vmin=-np.abs(z_value_results_on).max(),
             vmax=np.abs(z_value_results_on).max(),
         )
-        fig.colorbar(sub3, ax=axs[0, 2], fraction=0.03)
-        axs[0, 2].set_title("Z-score")
-        axs[0, 2].axis("off")
-
-        sub4 = axs[0, 3].imshow(subfield_on, cmap="gray", vmin=0, vmax=1)
         fig.colorbar(sub4, ax=axs[0, 3], fraction=0.03)
-        axs[0, 3].set_title("ON Subfield")
+        axs[0, 3].set_title("Z-score")
         axs[0, 3].axis("off")
+
+        sub5 = axs[0, 4].imshow(subfield_on, cmap="gray", vmin=0, vmax=1)
+        fig.colorbar(sub5, ax=axs[0, 4], fraction=0.03)
+        axs[0, 4].set_title("ON Subfield")
+        axs[0, 4].axis("off")
 
         sub1 = axs[1, 0].imshow(num_resp_trials_off, cmap="coolwarm")
         fig.colorbar(sub1, ax=axs[1, 0], fraction=0.03)
         axs[1, 0].set_title("Number of Responsive Trials")
         axs[1, 0].axis("off")
+
+        z_scored_num_resp_trials_off = (
+            num_resp_trials_off - np.mean(num_resp_trials_off)
+        ) / np.std(num_resp_trials_off)
+        sub2 = axs[1, 1].imshow(z_scored_num_resp_trials_off, cmap="coolwarm")
+        fig.colorbar(sub2, ax=axs[1, 1], fraction=0.03)
+        axs[1, 1].set_title("Z-scored Num Responsive Trials")
+        axs[1, 1].axis("off")
 
         norm_mean_stim_for_resp_trials_off_weighted = (
             mean_stim_for_resp_trials_off_weighted
@@ -477,26 +548,27 @@ class LocallySparseNoise(StimulusAnalysis):
             np.max(mean_stim_for_resp_trials_off_weighted)
             - np.min(mean_stim_for_resp_trials_off_weighted)
         )
-        sub2 = axs[1, 1].imshow(
+        sub3 = axs[1, 2].imshow(
             norm_mean_stim_for_resp_trials_off_weighted, cmap="gray"
         )
-        fig.colorbar(sub2, ax=axs[1, 1], fraction=0.03)
-        axs[1, 1].set_title("Weighted Mean Stimulus")
-        axs[1, 1].axis("off")
+        fig.colorbar(sub3, ax=axs[1, 2], fraction=0.03)
+        axs[1, 2].set_title("Weighted Mean Stimulus")
+        axs[1, 2].axis("off")
 
-        sub3 = axs[1, 2].imshow(
+        sub4 = axs[1, 3].imshow(
             z_value_results_off,
             cmap="coolwarm",
             vmin=-np.abs(z_value_results_off).max(),
             vmax=np.abs(z_value_results_off).max(),
         )
-        fig.colorbar(sub3, ax=axs[1, 2], fraction=0.03)
-        axs[1, 2].set_title("Z-score")
-        axs[1, 2].axis("off")
-
-        sub4 = axs[1, 3].imshow(subfield_off, cmap="gray_r", vmin=0, vmax=1)
         fig.colorbar(sub4, ax=axs[1, 3], fraction=0.03)
-        axs[1, 3].set_title("OFF Subfield")
+        axs[1, 3].set_title("Z-score")
+        axs[1, 3].axis("off")
+
+        sub5 = axs[1, 4].imshow(subfield_off, cmap="gray_r", vmin=0, vmax=1)
+        fig.colorbar(sub5, ax=axs[1, 4], fraction=0.03)
+        axs[1, 4].set_title("OFF Subfield")
+        axs[1, 4].axis("off")
 
         return fig, axs
 
