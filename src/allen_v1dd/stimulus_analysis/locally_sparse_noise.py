@@ -5,10 +5,9 @@ import pandas as pd
 import scipy.stats as st
 import matplotlib.pyplot as plt
 
-from sklearn.linear_model import Ridge
-from sklearn.model_selection import KFold
 import numpy as np
 import scipy.optimize as opt
+from scipy import ndimage
 
 
 from .stimulus_analysis import StimulusAnalysis
@@ -579,12 +578,38 @@ class LocallySparseNoise(StimulusAnalysis):
         except:
             return None, None, np.zeros_like(data), None
 
+    # @property
+    # def rf_centers(self):
+    #     """
+    #     Array of shape (n_rois, 2, 2). Dimension 1 corresponds to ON (0) and OFF (1). Dimension 2 corresponds to
+    #     azimuth (0) and altitude (1). Values of np.nan mean the ROI does not have a given RF.
+    #     """
+    #     if self._rf_centers is None:
+    #         self._rf_centers = np.full((self.n_rois, 2, 2), np.nan)
+
+    #         # Only iterate over ROIs with an RF
+    #         rois, onoffs, alts, azis = np.where(self.receptive_fields)
+
+    #         for roi in np.unique(rois):
+    #             roi_mask = rois == roi
+    #             for onoff in np.unique(onoffs[roi_mask]):
+    #                 mask = roi_mask & (onoffs == onoff)
+    #                 alt, azi = self.point_to_alt_azi(
+    #                     alt_ctr=np.mean(alts[mask]) + 0.5,
+    #                     azi_ctr=np.mean(azis[mask]) + 0.5,
+    #                 )  # Add 0.5 to center in pixel
+    #                 self._rf_centers[roi, onoff, :] = (azi, alt)
+
+    #     return self._rf_centers
+    
     @property
     def rf_centers(self):
         """
-        Array of shape (n_rois, 2, 2). Dimension 1 corresponds to ON (0) and OFF (1). Dimension 2 corresponds to
-        azimuth (0) and altitude (1). Values of np.nan mean the ROI does not have a given RF.
-        """
+        By default, returns the RF centers in the azimuth / altitute coordinate system, rather
+        than the pixel coordinate system. Array of shape (n_rois, 2, 2). 
+        Dimension 1 corresponds to ON (0) and OFF (1)."""
+
+
         if self._rf_centers is None:
             self._rf_centers = np.full((self.n_rois, 2, 2), np.nan)
 
@@ -594,12 +619,14 @@ class LocallySparseNoise(StimulusAnalysis):
             for roi in np.unique(rois):
                 roi_mask = rois == roi
                 for onoff in np.unique(onoffs[roi_mask]):
-                    mask = roi_mask & (onoffs == onoff)
-                    alt, azi = self.point_to_alt_azi(
-                        alt_ctr=np.mean(alts[mask]) + 0.5,
-                        azi_ctr=np.mean(azis[mask]) + 0.5,
-                    )  # Add 0.5 to center in pixel
-                    self._rf_centers[roi, onoff, :] = (azi, alt)
+                    responses = np.abs(self.receptive_fields[roi, onoff, :, :])
+                    responses_norm = responses - responses.min()
+                    responses_norm /= responses_norm.max() if responses_norm.max() != 0 else 1
+                    centroid_coords = ndimage.center_of_mass(responses_norm)
+                    x_coord = self.imshow_extent[0] + ((centroid_coords[1] + 0.5) / 14) * (self.imshow_extent[1] - self.imshow_extent[0])
+                    y_coord = self.imshow_extent[2] + ((centroid_coords[0] + 0.5) / 8) * (self.imshow_extent[3] - self.imshow_extent[2])
+
+                    self._rf_centers[roi, onoff, :] = (x_coord, y_coord)
 
         return self._rf_centers
 
@@ -668,12 +695,12 @@ class LocallySparseNoise(StimulusAnalysis):
             interpolation="none",
             origin="lower",
             vmin=0,
-            vmax=0.5,
+            vmax=1,
             extent=self.imshow_extent,
         )
         # ax.set_xticks(ticks=self.azimuths, labels=[f"{azi:.0f}" for azi in self.azimuths])
         # ax.set_yticks(ticks=self.altitudes, labels=[f"{alt:.0f}" for alt in self.altitudes])
-        ax.set_xlabel("Azimuth (°)", fontsize=12)
+        # ax.set_xlabel("Azimuth (°)", fontsize=12)
         ax.set_ylabel("Altitude (°)", fontsize=12)
         ax.set_title(
             f"{'ON' if is_on else 'OFF'} receptive field{'' if desc is None else f' ({desc})'}",
