@@ -8,8 +8,8 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import Ridge
 from sklearn.model_selection import KFold
 import numpy as np
+import scipy.optimize as opt
 
-# from statsmodels.sandbox.stats.multicomp import multipletests
 
 from .stimulus_analysis import StimulusAnalysis
 
@@ -63,10 +63,16 @@ class LocallySparseNoise(StimulusAnalysis):
         self._design_matrix = None
         self._trial_template = None
         self._receptive_fields = None
-        self._receptive_fields_sta = None
         self._rf_centers = None
         self._imshow_extent = None
-        self._pvals = None
+        self._stas = None
+        self._shuffled_stas = None
+        self._r2s = None
+        self._shuffled_r2s = None
+        # self._pvals = None
+        # self._receptive_fields_sta = None
+
+        self.whiten = True
 
     def save_to_h5(self, group):
         super().save_to_h5(group)
@@ -264,39 +270,6 @@ class LocallySparseNoise(StimulusAnalysis):
 
         return self._sweep_responses
 
-    @property
-    def pvals(self):
-        """
-        pvals is a np.ndarray of shape (n_sweeps, n_rois) where the value at
-        position (i, j) is the p-value of the jth ROI's response to the ith stimulus shown.
-        """
-
-        if self._pvals is None:
-
-            spont_vals = self.get_spont_null_dist(
-                self.baseline_time_window,
-                self.response_time_window,
-                n_boot=self.n_shuffles,
-                trace_type=self.trace_type,
-                cache=False,
-            )  # shape (n_rois, n_shuffles)
-
-            self._pvals = np.zeros((self.n_sweeps, self.n_rois), dtype=float)
-
-            spont_mean = np.nanmean(spont_vals, axis=1)  # shape (n_rois,)
-            spont_std = np.nanstd(spont_vals, axis=1)  # shape (n_rois,)
-
-            assert spont_mean.shape[0] == self.n_rois
-            assert spont_std.shape[0] == self.n_rois
-
-            for roi in range(self.n_rois):
-                zvals = (self.sweep_responses[:, roi] - spont_mean[roi]) / spont_std[
-                    roi
-                ]  # shape (n_sweeps,)
-                self._pvals[:, roi] = st.norm.sf(abs(zvals))  # One-tailed test
-
-        return self._pvals
-
     # @property
     # def receptive_fields(self):
     #     """
@@ -336,285 +309,275 @@ class LocallySparseNoise(StimulusAnalysis):
     #     return self._receptive_fields
 
     @property
-    def receptive_fields_new(self):
+    def receptive_fields(self):
+        """
+        Array of shape (n_rois, 2, n_image_rows, n_image_columns) where each entry is the value of the fitted 2D Gaussian kernel at
+        each pixel. Dimension 1 corresponds to ON (0) and OFF (1). Gaussian fits that don't converge are set to zero. ROIs that aren't
+        valid are set to zero.
+        """
+
         if self._receptive_fields is None:
-            design_matrix_int = self.design_matrix.astype(
-                int
-            )  # shape (2*n_pixels, n_sweeps)
-            pvals = self.pvals  # shape (n_sweeps, n_rois)
-            sig_sweep_responses = (
-                pvals < self.response_thresh_alpha
-            )  # shape (n_sweeps, n_rois)
+
             self._receptive_fields = np.zeros(
                 (self.n_rois, 2, *self.image_shape), dtype=float
             )
+            self._r2s = np.zeros((self.n_rois, 2), dtype=float)
+            self._shuffled_r2s = np.zeros((self.n_rois, 2), dtype=float)
+
+            stas = self.get_spike_triggered_averages(shuffle=False)
+            shuffled_stas = self.get_spike_triggered_averages(shuffle=True)
 
             for roi in range(self.n_rois):
-                design_matrix_int_roi = design_matrix_int[
-                    :, sig_sweep_responses[:, roi]
-                ]
 
-                # Calculate significant pixels for ON and OFF
-                pixels_on = self.calculate_sig_pixels_roi(
-                    design_matrix_int_roi, rf_type="on"
-                )  # shape (*self.image_shape, n_sig_sweeps)
-                pixels_off = self.calculate_sig_pixels_roi(
-                    design_matrix_int_roi, rf_type="off"
-                )  # shape (*self.image_shape, n_sig_sweeps)
+                on_sta = stas[roi, 0, :, :]
+                off_sta = stas[roi, 1, :, :]
 
-                # Calculate subfields
-                subfield_on, _, _, _ = self.calculate_subfield(
-                    roi,
-                    pixels_on,
-                    design_matrix_int_roi,
-                    sig_sweep_responses[:, roi],
-                    rf_type="on",
-                )  # shape self.image_shape
-                subfield_off, _, _, _ = self.calculate_subfield(
-                    roi,
-                    pixels_off,
-                    design_matrix_int_roi,
-                    sig_sweep_responses[:, roi],
-                    rf_type="off",
-                )  # shape self.image_shape
+                popt_on, pcov_on, fitted_on, r2_on = self.fit_gaussian(
+                    on_sta, type="on"
+                )
+                popt_off, pcov_off, fitted_off, r2_off = self.fit_gaussian(
+                    off_sta, type="off"
+                )
 
-                self._receptive_fields[roi, 0, :, :] = subfield_on
-                self._receptive_fields[roi, 1, :, :] = subfield_off
+                self._receptive_fields[roi, 0, :, :] = (
+                    fitted_on if r2_on is not None else np.zeros_like(on_sta)
+                )
+                self._receptive_fields[roi, 1, :, :] = (
+                    fitted_off if r2_off is not None else np.zeros_like(off_sta)
+                )
+                self._r2s[roi, 0] = r2_on if r2_on is not None else 0
+                self._r2s[roi, 1] = r2_off if r2_off is not None else 0
 
-            # Zero out invalid ROIs
+                # for shuffled distribution significance
+                on_sta_shuff = shuffled_stas[roi, 0, :, :]
+                off_sta_shuff = shuffled_stas[roi, 1, :, :]
+
+                popt_on_shuff, pcov_on_shuff, fitted_on_shuff, r2_on_shuff = (
+                    self.fit_gaussian(on_sta_shuff, type="on")
+                )
+                popt_off_shuff, pcov_off_shuff, fitted_off_shuff, r2_off_shuff = (
+                    self.fit_gaussian(off_sta_shuff, type="off")
+                )
+
+                self._shuffled_r2s[roi, 0] = (
+                    r2_on_shuff if r2_on_shuff is not None else 0
+                )
+                self._shuffled_r2s[roi, 1] = (
+                    r2_off_shuff if r2_off_shuff is not None else 0
+                )
+
+            ## Zero out invalid ROIs
             self._receptive_fields[~self.is_roi_valid, :, :, :] = 0
+
+            ## Zero out ROIs where fit is poor based on shuffled distribution
+            r2_on_threshold = np.percentile(self._shuffled_r2s[:, 0], 95)
+            r2_off_threshold = np.percentile(self._shuffled_r2s[:, 1], 95)
+            self._receptive_fields[self._r2s[:, 0] < r2_on_threshold, 0, :, :] = 0
+            self._receptive_fields[self._r2s[:, 1] < r2_off_threshold, 1, :, :] = 0
 
         return self._receptive_fields
 
-    @property
-    def receptive_fields_sta(self):
-        if self._receptive_fields_sta is None:
-            design_matrix_int = self.design_matrix.astype(
-                int
-            )  # shape (2*n_pixels, n_sweeps)
+    def get_spike_triggered_averages(self, shuffle=False):
+        """
+        Array of shape (n_rois, 2, n_image_rows, n_image_columns) where dimension 1 corresponds to ON (0) and OFF (1).
+        Returns the spike-triggered averages for each ROI and for ON and OFF pixels. Can optionally shuffle the
+        design matrix to get a null distribution. Also, note that the STAs are whitened by default to reduce stimulus
+        correlations (can change with self.whiten).
 
-            self._receptive_fields_sta = np.zeros(
-                (self.n_rois, 2, *self.image_shape), dtype=float
-            )
+        **Can probably rewrite this to be a bit more efficient (less repeated code)!**
+        """
 
-            for roi in range(self.n_rois):
-                model, best_a, best_score = self.ridge_cv(
-                    design_matrix_int.T, self.sweep_responses[:, roi]
+        if shuffle:
+            if self._shuffled_stas is None:
+                self._shuffled_stas = np.zeros(
+                    (self.n_rois, 2, *self.image_shape), dtype=float
                 )
-                w = model.coef_  # shape (2*n_pixels,)
-                b = model.intercept_  # scalar
 
-                w_on = w[:112].reshape(*self.image_shape)
-                w_off = w[112:].reshape(*self.image_shape)
+                design_matrix_int = self.design_matrix.astype(
+                    int
+                )  # shape (2*n_pixels, n_sweeps)
 
-                subfield_on = (w_on - w_on.mean()) / w_on.std()
-                subfield_on = subfield_on > 3
+                np.random.seed(0)
+                np.random.shuffle(design_matrix_int.T)  # shuffle along sweeps
+                assert (
+                    design_matrix_int.shape == self.design_matrix.shape
+                ), "shuffling changed design matrix shape!"
 
-                subfield_off = (w_off - w_off.mean()) / w_off.std()
-                subfield_off = subfield_off > 3
+                pixels_on = design_matrix_int[
+                    : design_matrix_int.shape[0] // 2, :
+                ].reshape(
+                    *self.image_shape, design_matrix_int.shape[1]
+                )  # on pixels
+                pixels_on = np.select(
+                    [pixels_on == 1, pixels_on == 0],
+                    [self.pixel_on, self.pixel_on / 2],
+                    pixels_on,
+                )
 
-                self._receptive_fields_sta[roi, 0, :, :] = subfield_on
-                self._receptive_fields_sta[roi, 1, :, :] = subfield_off
+                pixels_off = design_matrix_int[
+                    design_matrix_int.shape[0] // 2 :, :
+                ].reshape(
+                    *self.image_shape, design_matrix_int.shape[1]
+                )  # off pixels
+                pixels_off = np.select(
+                    [pixels_off == 1, pixels_off == 0],
+                    [self.pixel_off, self.pixel_on / 2],
+                    pixels_off,
+                )
 
-        return self._receptive_fields_sta
+                if self.whiten:
+                    mu, cov_matrix = self.get_whitening_params(pixels_on, pixels_off)
 
-    def ridge_cv(self, X, y, alphas=np.logspace(-2, 4, 20), n_splits=4):
-        kf = KFold(n_splits=n_splits, shuffle=True, random_state=0)
-        best_a, best_score = None, -np.inf
+                for roi in range(self.n_rois):
+                    on_sta = (pixels_on * self.sweep_responses[:, roi]).sum(
+                        axis=2
+                    ) / self.sweep_responses[:, roi].sum()
+                    off_sta = (pixels_off * self.sweep_responses[:, roi]).sum(
+                        axis=2
+                    ) / self.sweep_responses[:, roi].sum()
 
-        for a in alphas:
-            scores = []
-            for tr, te in kf.split(X):
-                model = Ridge(alpha=a, fit_intercept=True)
-                model.fit(X[tr], y[tr])
-                # R^2 on heldout (or correlation)
-                scores.append(model.score(X[te], y[te]))
-            m = np.mean(scores)
-            if m > best_score:
-                best_score, best_a = m, a
+                    if self.whiten:
+                        on_sta, off_sta = self.whiten_stas(
+                            mu, cov_matrix, on_sta, off_sta, roi
+                        )
 
-        model = Ridge(alpha=best_a, fit_intercept=True).fit(X, y)
-        return model, best_a, best_score
+                    self._shuffled_stas[roi, 0, :, :] = on_sta
+                    self._shuffled_stas[roi, 1, :, :] = off_sta
 
-    def visualize_receptive_fields(self, roi):
+            return self._shuffled_stas
 
-        design_matrix_int = self.design_matrix.astype(
-            int
-        )  # shape (2*n_pixels, n_sweeps)
-        pvals = self.pvals  # shape (n_sweeps, n_rois)
-        sig_sweep_responses = (
-            pvals < self.response_thresh_alpha
-        )  # shape (n_sweeps, n_rois)
+        if not shuffle:
+            if self._stas is None:
+                self._stas = np.zeros((self.n_rois, 2, *self.image_shape), dtype=float)
+                design_matrix_int = self.design_matrix.astype(
+                    int
+                )  # shape (2*n_pixels, n_sweeps)
+                pixels_on = design_matrix_int[
+                    : design_matrix_int.shape[0] // 2, :
+                ].reshape(
+                    *self.image_shape, design_matrix_int.shape[1]
+                )  # on pixels
+                pixels_on = np.select(
+                    [pixels_on == 1, pixels_on == 0],
+                    [self.pixel_on, self.pixel_on / 2],
+                    pixels_on,
+                )
 
-        design_matrix_int_roi = design_matrix_int[:, sig_sweep_responses[:, roi]]
+                pixels_off = design_matrix_int[
+                    design_matrix_int.shape[0] // 2 :, :
+                ].reshape(
+                    *self.image_shape, design_matrix_int.shape[1]
+                )  # off pixels
+                pixels_off = np.select(
+                    [pixels_off == 1, pixels_off == 0],
+                    [self.pixel_off, self.pixel_on / 2],
+                    pixels_off,
+                )
 
-        # Calculate significant pixels for ON and OFF
-        pixels_on = self.calculate_sig_pixels_roi(
-            design_matrix_int_roi, rf_type="on"
-        )  # shape (*self.image_shape, n_sig_sweeps)
-        pixels_off = self.calculate_sig_pixels_roi(
-            design_matrix_int_roi, rf_type="off"
-        )  # shape (*self.image_shape, n_sig_sweeps)
+                if self.whiten:
+                    mu, cov_matrix = self.get_whitening_params(pixels_on, pixels_off)
 
-        # Calculate subfields
-        (
-            subfield_on,
-            mean_stim_for_resp_trials_on_weighted,
-            z_value_results_on,
-            num_resp_trials_on,
-        ) = self.calculate_subfield(
-            roi,
-            pixels_on,
-            design_matrix_int_roi,
-            sig_sweep_responses[:, roi],
-            rf_type="on",
-        )  # shape self.image_shape
-        (
-            subfield_off,
-            mean_stim_for_resp_trials_off_weighted,
-            z_value_results_off,
-            num_resp_trials_off,
-        ) = self.calculate_subfield(
-            roi,
-            pixels_off,
-            design_matrix_int_roi,
-            sig_sweep_responses[:, roi],
-            rf_type="off",
-        )  # shape self.image_shape
+                for roi in range(self.n_rois):
+                    on_sta = (pixels_on * self.sweep_responses[:, roi]).sum(
+                        axis=2
+                    ) / self.sweep_responses[:, roi].sum()
+                    off_sta = (pixels_off * self.sweep_responses[:, roi]).sum(
+                        axis=2
+                    ) / self.sweep_responses[:, roi].sum()
 
-        # Zero out invalid ROIs
-        if not self.is_roi_valid[roi]:
-            print(f"ROI {roi} is not valid.")
+                    if self.whiten:
+                        on_sta, off_sta = self.whiten_stas(
+                            mu, cov_matrix, on_sta, off_sta, roi
+                        )
 
-        fig, axs = plt.subplots(2, 5, figsize=(15, 5))
+                    self._stas[roi, 0, :, :] = on_sta
+                    self._stas[roi, 1, :, :] = off_sta
 
-        sub1 = axs[0, 0].imshow(num_resp_trials_on, cmap="coolwarm")
-        fig.colorbar(sub1, ax=axs[0, 0], fraction=0.03)
-        axs[0, 0].set_title("Number of Responsive Trials")
-        axs[0, 0].axis("off")
+            return self._stas
 
-        z_scored_num_resp_trials_on = (
-            num_resp_trials_on - np.mean(num_resp_trials_on)
-        ) / np.std(num_resp_trials_on)
-        sub2 = axs[0, 1].imshow(z_scored_num_resp_trials_on, cmap="coolwarm")
-        fig.colorbar(sub2, ax=axs[0, 1], fraction=0.03)
-        axs[0, 1].set_title("Z-scored Num Responsive Trials")
-        axs[0, 1].axis("off")
+    def get_whitening_params(self, pixels_on, pixels_off):
+        pixels = pixels_on + pixels_off
+        pixels = pixels - (self.pixel_on / 2)  # center pixels around 127.5
+        flattened_pixels = pixels.reshape(-1, pixels.shape[2])  # (n_pixels, n_sweeps)
 
-        norm_mean_stim_for_resp_trials_on_weighted = (
-            mean_stim_for_resp_trials_on_weighted
-            - np.min(mean_stim_for_resp_trials_on_weighted)
-        ) / (
-            np.max(mean_stim_for_resp_trials_on_weighted)
-            - np.min(mean_stim_for_resp_trials_on_weighted)
+        mu = np.mean(flattened_pixels, axis=1, keepdims=True)
+        centered_pixels = flattened_pixels - mu  # shape (n_pixels, n_sweeps
+        cov_matrix = np.cov(centered_pixels)  # shape (n_pixels, n_pixels)
+
+        return mu, cov_matrix
+
+    def whiten_stas(self, mu, cov_matrix, on_sta, off_sta, lam=1e-3):
+
+        centered_on_sta = on_sta.flatten() - mu.flatten()
+        centered_off_sta = off_sta.flatten() - mu.flatten()
+
+        A = cov_matrix + lam * np.eye(cov_matrix.shape[0])
+        k_on = np.linalg.solve(A, centered_on_sta)  # whitened STA
+        k_off = np.linalg.solve(A, centered_off_sta)  # whitened STA
+
+        return k_on.reshape(self.image_shape), k_off.reshape(self.image_shape)
+
+    def twoD_Gaussian(self, xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
+        x, y = xy
+        xo = float(xo)
+        yo = float(yo)
+        a = (np.cos(theta) ** 2) / (2 * sigma_x**2) + (np.sin(theta) ** 2) / (
+            2 * sigma_y**2
         )
-        sub3 = axs[0, 2].imshow(norm_mean_stim_for_resp_trials_on_weighted, cmap="gray")
-        fig.colorbar(sub3, ax=axs[0, 2], fraction=0.03)
-        axs[0, 2].set_title("Weighted Mean Stimulus")
-        axs[0, 2].axis("off")
-
-        sub4 = axs[0, 3].imshow(
-            z_value_results_on,
-            cmap="coolwarm",
-            vmin=-np.abs(z_value_results_on).max(),
-            vmax=np.abs(z_value_results_on).max(),
+        b = -(np.sin(2 * theta)) / (4 * sigma_x**2) + (np.sin(2 * theta)) / (
+            4 * sigma_y**2
         )
-        fig.colorbar(sub4, ax=axs[0, 3], fraction=0.03)
-        axs[0, 3].set_title("Z-score")
-        axs[0, 3].axis("off")
-
-        sub5 = axs[0, 4].imshow(subfield_on, cmap="gray", vmin=0, vmax=1)
-        fig.colorbar(sub5, ax=axs[0, 4], fraction=0.03)
-        axs[0, 4].set_title("ON Subfield")
-        axs[0, 4].axis("off")
-
-        sub1 = axs[1, 0].imshow(num_resp_trials_off, cmap="coolwarm")
-        fig.colorbar(sub1, ax=axs[1, 0], fraction=0.03)
-        axs[1, 0].set_title("Number of Responsive Trials")
-        axs[1, 0].axis("off")
-
-        z_scored_num_resp_trials_off = (
-            num_resp_trials_off - np.mean(num_resp_trials_off)
-        ) / np.std(num_resp_trials_off)
-        sub2 = axs[1, 1].imshow(z_scored_num_resp_trials_off, cmap="coolwarm")
-        fig.colorbar(sub2, ax=axs[1, 1], fraction=0.03)
-        axs[1, 1].set_title("Z-scored Num Responsive Trials")
-        axs[1, 1].axis("off")
-
-        norm_mean_stim_for_resp_trials_off_weighted = (
-            mean_stim_for_resp_trials_off_weighted
-            - np.min(mean_stim_for_resp_trials_off_weighted)
-        ) / (
-            np.max(mean_stim_for_resp_trials_off_weighted)
-            - np.min(mean_stim_for_resp_trials_off_weighted)
+        c = (np.sin(theta) ** 2) / (2 * sigma_x**2) + (np.cos(theta) ** 2) / (
+            2 * sigma_y**2
         )
-        sub3 = axs[1, 2].imshow(
-            norm_mean_stim_for_resp_trials_off_weighted, cmap="gray"
+        g = offset + amplitude * np.exp(
+            -(a * ((x - xo) ** 2) + 2 * b * (x - xo) * (y - yo) + c * ((y - yo) ** 2))
         )
-        fig.colorbar(sub3, ax=axs[1, 2], fraction=0.03)
-        axs[1, 2].set_title("Weighted Mean Stimulus")
-        axs[1, 2].axis("off")
+        return g.ravel()
 
-        sub4 = axs[1, 3].imshow(
-            z_value_results_off,
-            cmap="coolwarm",
-            vmin=-np.abs(z_value_results_off).max(),
-            vmax=np.abs(z_value_results_off).max(),
-        )
-        fig.colorbar(sub4, ax=axs[1, 3], fraction=0.03)
-        axs[1, 3].set_title("Z-score")
-        axs[1, 3].axis("off")
+    def fit_gaussian(self, data, type=None):
+        """
+        data: 2D numpy array (lsn.image_shape) of average response to ON or OFF pixels
+        """
 
-        sub5 = axs[1, 4].imshow(subfield_off, cmap="gray_r", vmin=0, vmax=1)
-        fig.colorbar(sub5, ax=axs[1, 4], fraction=0.03)
-        axs[1, 4].set_title("OFF Subfield")
-        axs[1, 4].axis("off")
+        # Figure out initial guess parameters
+        if type is None:
+            idx = np.argmax(np.abs(data))
+        elif type == "on":
+            idx = np.argmax(data)
+        elif type == "off":
+            idx = np.argmin(data)
 
-        return fig, axs
+        x0_0, y0_0 = idx % data.shape[1], idx // data.shape[1]
+        A0 = data[y0_0, x0_0] - np.median(data)
+        B0 = np.median(data)
+        initial_guess = (A0, x0_0, y0_0, 1, 1, 0, B0)
 
-    def calculate_sig_pixels_roi(self, design_matrix_int_roi, rf_type="on"):
-        if (rf_type != "on") and (rf_type != "off"):
-            raise ValueError(f"rf_type must be 'on' or 'off', got {rf_type}")
+        # Create x and y coordinate arrays
+        x = np.arange(data.shape[1])
+        y = np.arange(data.shape[0])
+        x, y = np.meshgrid(x, y)
 
-        if rf_type == "on":
-            pixels = design_matrix_int_roi[:112].reshape(
-                *self.image_shape, design_matrix_int_roi.shape[1]
-            )
-            pixels = np.select(
-                [pixels == 1, pixels == 0], [self.pixel_on, self.pixel_on / 2], pixels
+        # Try fitting the Gaussian model to the data
+        try:
+            popt, pcov = opt.curve_fit(
+                self.twoD_Gaussian,
+                (x, y),
+                data.reshape(-1),
+                p0=initial_guess,
+                maxfev=100000,
             )
 
-        if rf_type == "off":
-            pixels = design_matrix_int_roi[112:].reshape(
-                *self.image_shape, design_matrix_int_roi.shape[1]
-            )
-            pixels = np.select(
-                [pixels == 1, pixels == 0], [self.pixel_off, self.pixel_on / 2], pixels
-            )
+            fitted_data = self.twoD_Gaussian((x, y), *popt).reshape(data.shape)
 
-        return pixels
+            resid = data - fitted_data
+            ss_res = np.sum(resid**2)
+            ss_tot = np.sum((data - data.mean()) ** 2) + 1e-12
+            r2 = 1 - ss_res / ss_tot
 
-    def calculate_subfield(
-        self, roi, pixels, design_matrix_int_roi, sig_sweep_responses_roi, rf_type=None
-    ):
-
-        if (rf_type != "on") and (rf_type != "off"):
-            raise ValueError(f"rf_type must be 'on' or 'off', got {rf_type}")
-
-        mean_stim = (
-            pixels * self.sweep_responses[sig_sweep_responses_roi, :][:, roi]
-        ).mean(axis=2)
-        z_vals = (mean_stim - mean_stim.mean()) / mean_stim.std()
-        num_resp_trials = (
-            design_matrix_int_roi.sum(axis=1)[:112].reshape(8, 14)
-            if rf_type == "on"
-            else design_matrix_int_roi.sum(axis=1)[112:].reshape(8, 14)
-        )
-
-        results = (abs(z_vals) > 2.5) & (
-            num_resp_trials >= 10
-        )  # threshold for significance
-        return results, mean_stim, z_vals, num_resp_trials
+            return popt, pcov, fitted_data, r2
+        except:
+            return None, None, np.zeros_like(data), None
 
     @property
     def rf_centers(self):
