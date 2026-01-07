@@ -68,6 +68,7 @@ class LocallySparseNoise(StimulusAnalysis):
         self._shuffled_stas = None
         self._r2s = None
         self._shuffled_r2s = None
+        self._rf_sigmas = None
         # self._pvals = None
         # self._receptive_fields_sta = None
 
@@ -315,11 +316,12 @@ class LocallySparseNoise(StimulusAnalysis):
         valid are set to zero.
         """
 
-        if self._receptive_fields is None:
+        if self._receptive_fields is None: # assumes that self._rf_sigmas is also None (i.e. hasn't been computed yet)
 
             self._receptive_fields = np.zeros(
                 (self.n_rois, 2, *self.image_shape), dtype=float
             )
+            self._rf_sigmas = np.zeros((self.n_rois, 2, 2), dtype=float)  # sigma_x, sigma_y
             self._r2s = np.zeros((self.n_rois, 2), dtype=float)
             self._shuffled_r2s = np.zeros((self.n_rois, 2), dtype=float)
 
@@ -337,6 +339,10 @@ class LocallySparseNoise(StimulusAnalysis):
                 popt_off, pcov_off, fitted_off, r2_off = self.fit_gaussian(
                     off_sta, type="off"
                 )
+                if popt_on is not None:
+                    self._rf_sigmas[roi, 0, :] = (popt_on[3], popt_on[4])  # sigma_x, sigma_y
+                if popt_off is not None:
+                    self._rf_sigmas[roi, 1, :] = (popt_off[3], popt_off[4]) # sigma_x, sigma_y
 
                 self._receptive_fields[roi, 0, :, :] = (
                     fitted_on if r2_on is not None else np.zeros_like(on_sta)
@@ -559,12 +565,15 @@ class LocallySparseNoise(StimulusAnalysis):
 
         # Try fitting the Gaussian model to the data
         try:
+            lower = [-np.inf, -np.inf, -np.inf, 1e-4, 1e-4, -np.pi/2, -np.inf]
+            upper = [np.inf, np.inf, np.inf, np.inf, np.inf, np.pi/2, np.inf]
             popt, pcov = opt.curve_fit(
                 self.twoD_Gaussian,
                 (x, y),
                 data.reshape(-1),
                 p0=initial_guess,
                 maxfev=100000,
+                bounds=(lower, upper),
             )
 
             fitted_data = self.twoD_Gaussian((x, y), *popt).reshape(data.shape)
@@ -629,6 +638,16 @@ class LocallySparseNoise(StimulusAnalysis):
                     self._rf_centers[roi, onoff, :] = (x_coord, y_coord)
 
         return self._rf_centers
+    
+    @property
+    def rf_sigmas(self):
+        """
+        """
+
+        if self._rf_sigmas is None:
+            _ = self.receptive_fields  # ensure that rf sigmas have been computed
+
+        return self._rf_sigmas
 
     def has_receptive_field(self, roi, rf_type=None):
         if rf_type is None:
