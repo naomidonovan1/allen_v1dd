@@ -523,6 +523,18 @@ class LocallySparseNoise(StimulusAnalysis):
         return k_on.reshape(self.image_shape), k_off.reshape(self.image_shape)
 
     def twoD_Gaussian(self, xy, amplitude, xo, yo, sigma_x, sigma_y, theta, offset):
+        """2D rotated Gaussian function to fit receptive fields.
+        
+        xy: tuple of np.ndarrays (X, Y) created via np.meshgrid
+        amplitude: peak amplitude
+        xo, yo: center coordinates
+        sigma_x, sigma_y: standard deviations along x and y axes
+        theta: rotation angle in radians
+        offset: baseline offset
+
+        Returns:
+            np.ndarray: Flattened array of Gaussian values at each (x, y) coordinate
+        """
         x, y = xy
         xo = float(xo)
         yo = float(yo)
@@ -542,6 +554,8 @@ class LocallySparseNoise(StimulusAnalysis):
 
     def fit_gaussian(self, data, type=None):
         """
+        Fit a 2D Gaussian to the given data. Optionally specify type as "on" or "off" to guide initial guess.
+
         data: 2D numpy array (lsn.image_shape) of average response to ON or OFF pixels
         """
 
@@ -642,6 +656,9 @@ class LocallySparseNoise(StimulusAnalysis):
     @property
     def rf_sigmas(self):
         """
+        Array of shape (n_rois, 2, 2). Dimension 1 corresponds to ON (0) and OFF (1). 
+        Dimension 2 corresponds to (sigma_x, sigma_y) of the fitted Gaussian. 
+        Values of np.nan mean the given ROI does not have a calculated RF.
         """
 
         if self._rf_sigmas is None:
@@ -649,14 +666,14 @@ class LocallySparseNoise(StimulusAnalysis):
 
         return self._rf_sigmas
 
-    def has_receptive_field(self, roi, rf_type=None):
-        if rf_type is None:
-            rf = self.receptive_fields[roi]
-        else:
-            rf = self.receptive_fields[roi, self._rf_type_idx(rf_type)]
-        return bool(
-            rf.max() >= self.frac_sig_trials_thresh
-        )  # otherwise it is a numpy type
+    # def has_receptive_field(self, roi, rf_type=None):
+    #     if rf_type is None:
+    #         rf = self.receptive_fields[roi]
+    #     else:
+    #         rf = self.receptive_fields[roi, self._rf_type_idx(rf_type)]
+    #     return bool(
+    #         rf.max() >= self.frac_sig_trials_thresh
+    #     )  # otherwise it is a numpy type
 
     def _rf_type_idx(self, rf_type):
         if type(rf_type) is int:
